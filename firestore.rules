@@ -1,0 +1,192 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Administrator verification: Token custom claim OR verified profile in users/{uid}
+    function hasTokenAdminClaim() {
+      return ('role' in request.auth.token && request.auth.token.role == 'admin') ||
+             ('admin' in request.auth.token && request.auth.token.admin == true);
+    }
+
+    function isProfileAdmin() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && (hasTokenAdminClaim() || isProfileAdmin());
+    }
+
+    // Officer verification
+    function hasTokenOfficerClaim() {
+      return ('role' in request.auth.token && request.auth.token.role == 'officer') ||
+             ('officer' in request.auth.token && request.auth.token.officer == true);
+    }
+
+    function isProfileOfficer() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'officer';
+    }
+
+    function isOfficer() {
+      return isAuthenticated() && (hasTokenOfficerClaim() || isProfileOfficer());
+    }
+
+    function isAssignedPrimaryOfficer(complaintData) {
+      return isAuthenticated() && (
+        ('primaryOfficerId' in complaintData && complaintData.primaryOfficerId == request.auth.uid) ||
+        ('primaryOfficerUid' in complaintData && complaintData.primaryOfficerUid == request.auth.uid)
+      );
+    }
+
+    function isAssignedSupportingOfficer(complaintData) {
+      return isAuthenticated() && (
+        ('supportingOfficerIds' in complaintData && request.auth.uid in complaintData.supportingOfficerIds) ||
+        ('supportingOfficerUids' in complaintData && request.auth.uid in complaintData.supportingOfficerUids)
+      );
+    }
+
+    function isAssignedOfficer(complaintData) {
+      return isAssignedPrimaryOfficer(complaintData) || isAssignedSupportingOfficer(complaintData);
+    }
+
+    // 1. User Profiles Collection: users/{uid}
+    match /users/{userId} {
+      // Citizens read own; Admins and Officers can read profiles for directory/assignment
+      allow read: if isOwner(userId) || isAdmin() || isOfficer();
+
+      // Users can register their own profile, but CANNOT grant themselves admin or officer role
+      allow create: if isOwner(userId) && (
+        !('role' in request.resource.data) ||
+        request.resource.data.role == 'citizen' ||
+        isAdmin()
+      );
+
+      // Users can update their profile, but CANNOT modify role, departmentId, uid, or createdAt
+      allow update: if (isOwner(userId) && (
+        (!('role' in request.resource.data) || request.resource.data.role == resource.data.role) &&
+        (!('departmentId' in request.resource.data) || request.resource.data.departmentId == resource.data.departmentId) &&
+        (!('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid) &&
+        (!('createdAt' in request.resource.data) || request.resource.data.createdAt == resource.data.createdAt)
+      )) || isAdmin();
+
+      allow delete: if isAdmin();
+    }
+
+    // 2. Departments Collection: departments/{deptId}
+    match /departments/{deptId} {
+      // All authenticated users can read municipal departments
+      allow read: if isAuthenticated();
+
+      // Only administrators can create, update, or remove departments and officer memberships
+      allow create, update, delete: if isAdmin();
+    }
+
+    // 3. Complaints Collection: complaints/{complaintId}
+    match /complaints/{complaintId} {
+      // Access granted to:
+      // - Citizen owner
+      // - Administrator
+      // - Assigned Primary Officer
+      // - Assigned Supporting Officer
+      allow read: if (isAuthenticated() && resource.data.userId == request.auth.uid) ||
+                     isAdmin() ||
+                     isAssignedOfficer(resource.data);
+
+      // Authenticated citizens and verified administrators can create complaints
+      allow create: if (
+        isAuthenticated() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == 'Reported' &&
+        request.resource.data.priority in ['Low', 'Medium', 'High', 'Critical'] &&
+        (!('assignedDepartment' in request.resource.data) || request.resource.data.assignedDepartment == null) &&
+        (!('primaryOfficerId' in request.resource.data) || request.resource.data.primaryOfficerId == null)
+      ) || isAdmin();
+
+      // Update permissions:
+      // - Admins: full update privileges (assignment, verification, status changes)
+      // - Primary Officer: accept assignment, update progress, submit resolution (status: 'Resolution Submitted')
+      // - Supporting Officer: accept assignment, update work progress notes (CANNOT submit resolution or mark resolved)
+      allow update: if isAdmin() ||
+        (
+          isAssignedPrimaryOfficer(resource.data) &&
+          (
+            // Primary officer can accept assignment
+            (resource.data.status == 'Assigned' && request.resource.data.status == 'In Progress') ||
+            // Primary officer can submit final resolution
+            (resource.data.status == 'In Progress' && request.resource.data.status == 'Resolution Submitted') ||
+            // Primary officer updates work notes without changing primary assignment
+            (
+              (!('primaryOfficerId' in request.resource.data) || request.resource.data.primaryOfficerId == resource.data.primaryOfficerId) &&
+              (!('primaryOfficerUid' in request.resource.data) || request.resource.data.primaryOfficerUid == resource.data.primaryOfficerUid)
+            )
+          )
+        ) ||
+        (
+          isAssignedSupportingOfficer(resource.data) &&
+          (
+            // Supporting officer can accept assignment
+            (resource.data.status == 'Assigned' && request.resource.data.status == 'In Progress') ||
+            // Supporting officer CANNOT submit final resolution or resolve
+            (request.resource.data.status != 'Resolution Submitted' && request.resource.data.status != 'Resolved')
+          )
+        );
+
+      allow delete: if isAdmin();
+
+      // 4. Status & Assignment History Subcollection: complaints/{complaintId}/history/{historyId}
+      match /history/{historyId} {
+        allow read: if (
+          isAuthenticated() &&
+          get(/databases/$(database)/documents/complaints/$(complaintId)).data.userId == request.auth.uid
+        ) || isAdmin() || isAssignedOfficer(get(/databases/$(database)/documents/complaints/$(complaintId)).data);
+
+        // Created by Citizen ('Reported'), Admin, or Assigned Officers
+        allow create: if (
+          isAuthenticated() &&
+          request.resource.data.newStatus == 'Reported' &&
+          (!('previousStatus' in request.resource.data) || request.resource.data.previousStatus == null)
+        ) || isAdmin() || isAssignedOfficer(get(/databases/$(database)/documents/complaints/$(complaintId)).data);
+
+        // Immutable history
+        allow update, delete: if false;
+      }
+    }
+
+    // 5. In-App Notifications Collection: notifications/{notificationId}
+    match /notifications/{notificationId} {
+      // Recipient can read their own notifications; Admins can read admin-targeted notifications
+      allow read: if (isAuthenticated() && resource.data.recipientUid == request.auth.uid) ||
+                     (isAdmin() && resource.data.recipientRole == 'admin');
+
+      // Authenticated users can create notifications triggered by lifecycle events
+      allow create: if isAuthenticated();
+
+      // Recipient or admin can mark read
+      allow update: if (isAuthenticated() && resource.data.recipientUid == request.auth.uid) || isAdmin();
+
+      allow delete: if (isAuthenticated() && resource.data.recipientUid == request.auth.uid) || isAdmin();
+    }
+
+    // 6. Admin Audit Logs Collection: adminAuditLogs/{logId}
+    match /adminAuditLogs/{logId} {
+      // Only verified administrators can inspect administrative access audit logs
+      allow read: if isAdmin();
+
+      // Only administrators can append entries to the audit trail
+      allow create: if isAdmin();
+
+      // Audit logs are strictly immutable: updates and deletions are barred
+      allow update, delete: if false;
+    }
+  }
+}
