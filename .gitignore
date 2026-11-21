@@ -30,3 +30,23 @@ dist-ssr
 .env.test.local
 .env.production.local
 serviceAccountKey.json
+
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Firebase service account credentials
+serviceAccountKey.json
+*-service-account*.json
+firebase-adminsdk-*.json
+
+# Local development
+.DS_Store
